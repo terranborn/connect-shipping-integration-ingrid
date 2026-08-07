@@ -1,6 +1,6 @@
 {
   "name": "shipping-integration-ingrid",
-  "version": "3.3.5.3-pierce",
+  "version": "3.3.5.4-pierce",
   "description": "shipping integration ingrid connector",
   "main": "dist/server.js",
   "scripts": {
