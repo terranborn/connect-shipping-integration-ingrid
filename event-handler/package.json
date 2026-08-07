@@ -1,6 +1,6 @@
 {
   "name": "shipping-integration-ingrid",
-  "version": "3.3.5",
+  "version": "3.3.5.3-pierce",
   "main": "index.js",
   "license": "MIT",
   "private": true,
@@ -49,7 +49,7 @@
     "typescript": "^5.9.2"
   },
   "dependencies": {
-    "@commercetools-backend/loggers": "^24.5.0",
+    "@commercetools-backend/loggers": "^27.9.0",
     "@commercetools/platform-sdk": "^8.15.0",
     "@commercetools/ts-client": "^4.1.0",
     "axios": "^1.11.0",
