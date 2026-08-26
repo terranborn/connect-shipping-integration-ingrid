@@ -19,6 +19,9 @@ export const errorMiddleware: ErrorRequestHandler = (
       stack: isDevelopment ? error.stack : undefined,
     });
   } else {
+    logger.error(
+      `Unhandled error - message will not be retried: ${error.message}`
+    );
     res
       .status(202)
       .send(
