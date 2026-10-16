@@ -18,6 +18,12 @@ interface MockGetOrderResponse {
       };
     };
     orderNumber?: string;
+    shipmentState?: string;
+    shippingCustomFields?: {
+      fields?: {
+        ingridTransportOrderId?: string;
+      };
+    };
   };
 }
 

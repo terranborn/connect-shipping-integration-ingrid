@@ -89,14 +89,17 @@ export class IngridShippingService extends AbstractShippingService {
           .sort()
           .every((code, idx) => code === voucherCodes.slice().sort()[idx])); // All elements match in both arrays are considered unchanged
     if (!isVoucherCodesUnchanged) {
-      const updatedIngridCheckoutSessionPayload: IngridUpdateSessionRequestPayload = {
-        cart: {
-          ...ingridCheckoutSession.session.cart,
-          vouchers: voucherCodes,
-        },
-        checkout_session_id: ingridCheckoutSession.session.checkout_session_id,
-      };
-      ingridCheckoutSession = await this.ingridClient.updateCheckoutSession(updatedIngridCheckoutSessionPayload);
+      ingridCheckoutSession = await this.updateIngridSessionWithConflictRetry(
+        ingridSessionId,
+        ingridCheckoutSession,
+        (session) => ({
+          cart: {
+            ...session.session.cart,
+            vouchers: voucherCodes,
+          },
+          checkout_session_id: session.session.checkout_session_id,
+        }),
+      );
     }
 
     return ingridCheckoutSession;
@@ -156,15 +159,21 @@ export class IngridShippingService extends AbstractShippingService {
 
     // if prices are not the same, update Ingrid checkout session
     if (ingridTotalValue !== commercetoolsTotalTaxedValue) {
-      // we assume that the updated cart now has taxed prices
-      const updatedIngridCheckoutSessionPayload: IngridUpdateSessionRequestPayload = {
-        ...transformCommercetoolsCartToIngridPayload(updatedCart, voucherCodes),
-        checkout_session_id: ingridSessionId,
-      };
-
-      // the price push above can make Ingrid re-select a delivery group, so the refreshed
+      // the price push below can make Ingrid re-select a delivery group, so the refreshed
       // session is written back to the cart to avoid leaving it stale
-      ingridCheckoutSession = await this.ingridClient.updateCheckoutSession(updatedIngridCheckoutSessionPayload);
+      ingridCheckoutSession = await this.updateIngridSessionWithConflictRetry(
+        ingridSessionId,
+        ingridCheckoutSession,
+        // we assume that the updated cart now has taxed prices
+        () => ({
+          ...transformCommercetoolsCartToIngridPayload(updatedCart, voucherCodes),
+          checkout_session_id: ingridSessionId,
+        }),
+        // a concurrent change to the Ingrid session (e.g. the customer picking a different
+        // delivery option) can itself resolve the price drift that triggered this push, in
+        // which case there's nothing left to send
+        (session) => session.session.cart.total_value === commercetoolsTotalTaxedValue,
+      );
       updatedCart = await this.writeIngridSelectionToCart(updatedCart, ingridCheckoutSession, ingridTaxCategoryKey);
     }
     appLogger.info(
@@ -320,10 +329,66 @@ export class IngridShippingService extends AbstractShippingService {
   }
 
   /**
-   * Updates the cart with the Ingrid session ID
+   * Calls `updateCheckoutSession`, and if Ingrid rejects it because the session was
+   * concurrently modified (409), re-pulls the latest session and retries with a freshly
+   * recomputed payload.
    *
-   * @param cartId - The ID of the cart to update
-   * @param cartVersion - The version of the cart to update
+   * @remarks
+   * Unlike a commercetools version conflict, Ingrid's update payload carries no version token
+   * to simply resubmit, so a 409 here means the session actually moved since `initialSession`
+   * was read (e.g. the customer changed something in the widget). Blindly retrying the exact
+   * same payload could just 409 again, so each retry rebuilds the payload from a fresh pull.
+   *
+   * @param ingridSessionId - The Ingrid checkout session ID being updated
+   * @param initialSession - The most recently fetched session, used for the first attempt so a
+   * redundant pull isn't made before any conflict has actually happened
+   * @param buildPayload - Builds the update payload from a (possibly refreshed) session
+   * @param isAlreadyConsistent - Given a freshly pulled session (after a 409), returns true if
+   * the update is no longer needed, e.g. because the concurrent change already resolved the
+   * discrepancy that triggered it - in which case that session is returned as-is
+   *
+   * @returns {Promise<IngridUpdateSessionResponse>} The updated (or already consistent) session
+   */
+  private async updateIngridSessionWithConflictRetry(
+    ingridSessionId: string,
+    initialSession: IngridGetSessionResponse | IngridUpdateSessionResponse,
+    buildPayload: (
+      session: IngridGetSessionResponse | IngridUpdateSessionResponse,
+    ) => IngridUpdateSessionRequestPayload,
+    isAlreadyConsistent?: (session: IngridGetSessionResponse) => boolean,
+    maxAttempts = 3,
+  ): Promise<IngridUpdateSessionResponse> {
+    let session: IngridGetSessionResponse | IngridUpdateSessionResponse = initialSession;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.ingridClient.updateCheckoutSession(buildPayload(session));
+      } catch (error) {
+        const statusCode = error instanceof CustomError ? error.httpErrorStatus : undefined;
+        if (statusCode !== 409 || attempt === maxAttempts) {
+          throw error;
+        }
+        appLogger.error(
+          `[WARN]: Ingrid session "${ingridSessionId}" was modified concurrently, refetching latest session and retrying (attempt ${attempt}/${maxAttempts}).`,
+        );
+        session = await this.ingridClient.getCheckoutSession(ingridSessionId);
+        if (isAlreadyConsistent?.(session)) {
+          return session;
+        }
+      }
+    }
+    /* istanbul ignore next -- unreachable: the loop above always returns or throws */
+    throw new CustomError({
+      message: `Failed to update Ingrid session "${ingridSessionId}" after ${maxAttempts} attempts due to concurrent modification.`,
+      code: 'INGRID_SESSION_CONCURRENT_MODIFICATION_RETRY_EXHAUSTED',
+      httpErrorStatus: 409,
+    });
+  }
+
+  /**
+   * Updates the cart with the Ingrid session ID, and if it fails because the cart was
+   * concurrently modified (409), re-fetches the latest cart version and retries.
+   *
+   * @param cart - The cart to update
    * @param ingridSessionId - The Ingrid session ID to set on the cart
    * @param customTypeId - The ID of the custom type to set on the cart
    *
@@ -333,22 +398,48 @@ export class IngridShippingService extends AbstractShippingService {
     cart: Cart,
     ingridSessionId: string,
     customTypeId: string,
+    maxAttempts = 3,
   ): Promise<Cart> {
-    if (!cart.custom) {
-      cart = await this.commercetoolsClient.setCartCustomType(cart.id, cart.version, customTypeId);
+    let currentCart = cart;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        if (!currentCart.custom) {
+          currentCart = await this.commercetoolsClient.setCartCustomType(
+            currentCart.id,
+            currentCart.version,
+            customTypeId,
+          );
+        }
+        const updatedCart = await this.commercetoolsClient.setCartCustomField(
+          currentCart.id,
+          currentCart.version,
+          'ingridSessionId',
+          ingridSessionId,
+        );
+        appLogger.info(`[SUCCESS]: IngridSessionId ${ingridSessionId} is set on cart ${updatedCart.id}.`);
+        return updatedCart;
+      } catch (error) {
+        const statusCode = (error as { statusCode?: number })?.statusCode;
+        if (statusCode !== 409 || attempt === maxAttempts) {
+          appLogger.error(`[ERROR]: Failed to set IngridSessionId ${ingridSessionId} on cart ${currentCart.id}.`);
+          throw new CustomError({
+            message: (error as { message?: string })?.message ?? '',
+            code: (error as { code?: string })?.code ?? '',
+            httpErrorStatus: statusCode ?? 500,
+            cause: error,
+          });
+        }
+        appLogger.error(
+          `[WARN]: Concurrent modification setting IngridSessionId on cart "${currentCart.id}", refetching latest version and retrying (attempt ${attempt}/${maxAttempts}).`,
+        );
+        currentCart = await this.commercetoolsClient.getCartById(currentCart.id);
+      }
     }
-    cart = await this.commercetoolsClient
-      .setCartCustomField(cart.id, cart.version, 'ingridSessionId', ingridSessionId)
-      .catch((error) => {
-        appLogger.error(`[ERROR]: Failed to set IngridSessionId ${ingridSessionId} on cart ${cart.id}.`);
-        throw new CustomError({
-          message: error?.message,
-          code: error.code,
-          httpErrorStatus: error.statusCode,
-          cause: error,
-        });
-      });
-    appLogger.info(`[SUCCESS]: IngridSessionId ${ingridSessionId} is set on cart ${cart.id}.`);
-    return cart;
+    /* istanbul ignore next -- unreachable: the loop above always returns or throws */
+    throw new CustomError({
+      message: `Failed to set IngridSessionId ${ingridSessionId} on cart "${cart.id}" after ${maxAttempts} attempts due to concurrent modification.`,
+      code: 'CART_CONCURRENT_MODIFICATION_RETRY_EXHAUSTED',
+      httpErrorStatus: 409,
+    });
   }
 }

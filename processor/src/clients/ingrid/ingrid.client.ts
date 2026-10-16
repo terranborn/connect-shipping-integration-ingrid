@@ -1,5 +1,6 @@
 import axios, { type AxiosInstance } from 'axios';
 
+import { appLogger } from '../../libs/logger';
 import {
   IngridBasePath,
   type IngridCreateSessionRequestPayload,
@@ -153,6 +154,12 @@ const createClient = (opts: { apiSecret: string; environment: keyof typeof Ingri
   instance.interceptors.response.use(
     (response) => response,
     (error) => {
+      if (axios.isAxiosError(error) && error.response) {
+        appLogger.error(
+          `[ERROR]: Ingrid API responded with status ${error.response.status} for ${error.config?.method?.toUpperCase()} ${error.config?.url}: ${JSON.stringify(error.response.data)}`,
+        );
+      }
+
       throw new CustomError({
         message: error?.message,
         code: error.code || '',

@@ -1,6 +1,6 @@
 {
   "name": "shipping-integration-ingrid",
-  "version": "3.3.5.6-pierce",
+  "version": "3.3.5.7-pierce",
   "main": "index.js",
   "license": "MIT",
   "private": true,

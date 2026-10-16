@@ -294,3 +294,7 @@ export type IngridCompleteSessionRequestPayload = {
 export type IngridCompleteSessionResponse = {
   session: IngridSession;
 };
+
+export type IngridGetSessionResponse = {
+  session: IngridSession;
+};

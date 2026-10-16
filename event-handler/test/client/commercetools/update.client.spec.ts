@@ -1,6 +1,7 @@
 import * as createClientModule from '../../../src/client/commercetools/create.client';
 import { changeShipmentState } from '../../../src/client/commercetools/update.client';
 import { readConfiguration } from '../../../src/utils/config.utils';
+import CustomError from '../../../src/errors/custom.error';
 import type {
   ByProjectKeyOrdersRequestBuilder,
   ByProjectKeyRequestBuilder,
@@ -64,6 +65,75 @@ describe('Update Client', () => {
         id: mockOrderId,
         version: mockOrderVersion + 1,
       });
+    });
+
+    it('retries once on a concurrent modification (409) and succeeds', async () => {
+      const mockOrderId = 'test-order-id';
+      const conflictError = Object.assign(new Error('ConcurrentModification'), {
+        statusCode: 409,
+      });
+
+      const post = jest
+        .fn()
+        .mockReturnValueOnce({ execute: () => Promise.reject(conflictError) })
+        .mockReturnValueOnce({
+          execute: () =>
+            Promise.resolve({ body: { id: mockOrderId, version: 3 } }),
+        });
+      const get = jest.fn().mockReturnValue({
+        execute: () => Promise.resolve({ body: { version: 2 } }),
+      });
+      const withId = jest.fn().mockReturnValue({ post, get });
+      const orders = jest.fn().mockReturnValue({ withId });
+
+      jest
+        .spyOn(createClientModule, 'createApiRoot')
+        .mockReturnValue({ orders } as unknown as ByProjectKeyRequestBuilder);
+
+      const result = await changeShipmentState(mockOrderId, 1, 'Ready');
+
+      expect(result).toEqual({ id: mockOrderId, version: 3 });
+      expect(post).toHaveBeenCalledTimes(2);
+      expect(post).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          body: expect.objectContaining({ version: 1 }),
+        })
+      );
+      expect(post).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          body: expect.objectContaining({ version: 2 }),
+        })
+      );
+    });
+
+    it('wraps a non-conflict error as a retryable CustomError without retrying', async () => {
+      const mockOrderId = 'test-order-id';
+      const serverError = Object.assign(new Error('Internal Server Error'), {
+        statusCode: 500,
+      });
+
+      const post = jest
+        .fn()
+        .mockReturnValue({ execute: () => Promise.reject(serverError) });
+      const withId = jest.fn().mockReturnValue({ post });
+      const orders = jest.fn().mockReturnValue({ withId });
+
+      jest
+        .spyOn(createClientModule, 'createApiRoot')
+        .mockReturnValue({ orders } as unknown as ByProjectKeyRequestBuilder);
+
+      let caughtError: unknown;
+      try {
+        await changeShipmentState(mockOrderId, 1, 'Ready');
+      } catch (error) {
+        caughtError = error;
+      }
+
+      expect(caughtError).toBeInstanceOf(CustomError);
+      expect((caughtError as CustomError).statusCode).toBe(502);
+      expect(post).toHaveBeenCalledTimes(1);
     });
   });
 });
