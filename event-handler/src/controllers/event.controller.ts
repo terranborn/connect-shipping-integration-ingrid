@@ -60,6 +60,21 @@ export const post = async (request: Request, response: Response) => {
     );
   }
 
+  if (
+    commercetoolsOrder.shipmentState === SHIPMENT_STATE.READY ||
+    commercetoolsOrder.shipmentState === SHIPMENT_STATE.CANCELED
+  ) {
+    // This message may be a Pub/Sub redelivery of one already processed (Pub/Sub is
+    // at-least-once) - a prior invocation already reached a terminal shipment state, so
+    // reprocessing would at best repeat work and at worst race the already-committed result.
+    const loggingMessage = `Shipment state for order ID ${orderId} is already ${commercetoolsOrder.shipmentState}, skipping reprocessing.`;
+    logger.info(loggingMessage);
+    return response.status(204).send({
+      orderId,
+      shipmentState: commercetoolsOrder.shipmentState,
+    });
+  }
+
   const ingridSessionId =
     commercetoolsOrder.cart?.obj?.custom?.fields?.ingridSessionId;
 
@@ -97,10 +112,31 @@ export const post = async (request: Request, response: Response) => {
       );
     }
     completeCheckoutSessionError = error as Error;
+
+    // The complete call can fail locally (e.g. a timeout) or be rejected (e.g. a 409)
+    // while Ingrid actually already completed the session - check the session's real
+    // status before deciding the completion failed and cancelling the order's shipment.
+    try {
+      const sessionResponse =
+        await ingridClient.getCheckoutSession(ingridSessionId);
+      if (sessionResponse.session.status === 'COMPLETE') {
+        logger.info(
+          `Ingrid session ${ingridSessionId} for order ID ${orderId} is already COMPLETE despite the completion error, proceeding as successful.`
+        );
+        ingridResponse = sessionResponse;
+        completeCheckoutSessionError = undefined;
+      }
+    } catch (lookupError) {
+      logger.error(
+        `Failed to verify Ingrid session status for order ID ${orderId} after completion error: ${lookupError instanceof Error ? lookupError.message : String(lookupError)}`
+      );
+    }
   }
 
   if (ingridResponse) {
     const transportOrderId = ingridResponse.session.delivery_groups[0]?.tos_id;
+    const existingTransportOrderId = commercetoolsOrder.shippingCustomFields
+      ?.fields?.ingridTransportOrderId as string | undefined;
     let updatedCommercetoolsOrder;
     if (transportOrderId) {
       logger.info(
@@ -113,6 +149,22 @@ export const post = async (request: Request, response: Response) => {
         transportOrderId
       );
     }
+
+    if (
+      ingridResponse.session.status === 'COMPLETE' &&
+      !transportOrderId &&
+      !existingTransportOrderId
+    ) {
+      // Ingrid reports the session as COMPLETE but hasn't produced a transport order ID yet -
+      // marking the shipment Ready now would leave the order without one, and it isn't a
+      // permanent failure either since the session did complete, so ask for a retry instead
+      // (e.g. a redelivered message) once the transport order ID becomes available.
+      throw new CustomError(
+        502,
+        `Ingrid session ${ingridSessionId} for order ID ${orderId} is COMPLETE but has no transport order ID yet.`
+      );
+    }
+
     if (ingridResponse.session.status === 'COMPLETE') {
       const updateOrderResult = await changeShipmentState(
         orderId,
@@ -122,7 +174,7 @@ export const post = async (request: Request, response: Response) => {
         SHIPMENT_STATE.READY
       );
       logger.info(
-        `complete ingrid session successfully with transport order ID ${transportOrderId}: ${JSON.stringify(ingridResponse)}`
+        `complete ingrid session successfully with transport order ID ${transportOrderId ?? existingTransportOrderId}: ${JSON.stringify(ingridResponse)}`
       );
       logger.info(
         `Update commercetools cart shipment state as ready. (orderId: ${updateOrderResult.id})`

@@ -24,8 +24,10 @@ app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
 // Define routes
 app.use('/', EventRoutes);
-app.use('*splat', (_req, _res, next) => {
-  next(new CustomError(404, 'Path not found.'));
+app.use('*splat', (req, _res, next) => {
+  next(
+    new CustomError(404, `Path not found: ${req.method} ${req.originalUrl}`)
+  );
 });
 // Global error handler
 app.use(errorMiddleware);
